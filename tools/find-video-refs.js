@@ -1,18 +1,9 @@
 const fs = require('fs');
 const path = require('path');
+const { ROOT, TEXT_EXTS } = require('../config');
 
-// ROOT：项目根目录。
-const ROOT = path.resolve(__dirname, '..');
-
-// 视频引用匹配规则。
-// 只查常见网页视频格式；如果网站用 mpeg-dash 或其他扩展名，可以加到这里。
 const VIDEO_RE = /["'`]([^"'`]+?\.(?:mp4|webm|mov|m3u8)(?:\?[^"'`]*)?)["'`]/gi;
 
-// 只扫描文本类文件，避免把二进制资源当文本读。
-const TEXT_EXTS = new Set(['.html', '.js', '.mjs', '.json', '.css', '.txt']);
-
-// 递归列出目录文件。
-// node_modules 通常很大且不是目标站资源，所以跳过。
 function walk(dir, output = []) {
     for (const entry of fs.readdirSync(dir, { withFileTypes: true })) {
         if (entry.name === 'node_modules') continue;
@@ -23,7 +14,6 @@ function walk(dir, output = []) {
     return output;
 }
 
-// 主流程：扫描项目文本文件，输出视频 URL 或路径。
 for (const filePath of walk(ROOT)) {
     if (filePath.includes(`${path.sep}tools${path.sep}`)) continue;
     if (!TEXT_EXTS.has(path.extname(filePath).toLowerCase())) continue;

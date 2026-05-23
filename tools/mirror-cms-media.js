@@ -1,95 +1,25 @@
 const fs = require('fs');
 const path = require('path');
+const {
+    ROOT, TARGET_HOST, MIRROR_NAME, TIMEOUT_MS, CONCURRENCY,
+    ASSET_EXTS, MAGIC_BYTES, IMAGE_EXTS, MIRROR_DIR, CMS_HOST
+} = require('../config');
 
-// ROOT：项目根目录。脚本在 tools 目录里，所以向上一级。
-const ROOT = path.resolve(__dirname, '..');
-
-// ====== CMS 媒体补充下载配置 ======
-// 这个脚本是通用下载器的补充，不影响 tools/mirror-assets.js。
-// 用途：处理“资源藏在 CMS JSON / 远程存储桶 / 缓存号里”的网站。
-const TARGET_HOST = process.env.TARGET_HOST || 'https://example.com';
-const MIRROR_NAME = process.env.MIRROR_NAME || 'example.com';
-const CMS_HOST = process.env.CMS_MEDIA_HOST || 'https://storage.example.com/example-bucket';
-
-// TIMEOUT_MS：单个远程请求超时时间，防止下载一直卡住。
-const TIMEOUT_MS = Number(process.env.MIRROR_TIMEOUT_MS || 30000);
-
-// CONCURRENCY：并发下载数量。太高容易被限流，默认 6。
-const CONCURRENCY = Number(process.env.MIRROR_CONCURRENCY || 6);
-
-// CACHE_PATTERNS：有些网站会用缓存号拼核心 JS / JSON 文件名。
-// 例如 app.123.js、uil.123.json。
 const CACHE_PATTERNS = [
     /window\._CACHE_\s*=\s*["']([^"']+)["']/,
     /_CACHE_\s*=\s*["']([^"']+)["']/
 ];
 
-// CMS_PAGES：常见 CMS JSON 入口。
-// 很多视频、图片和项目数据不在首页 HTML 里，而是藏在这些 JSON 里。
 const CMS_PAGES = [
     'metadata',
     'contact',
     'projects'
 ];
 
-// ASSET_EXTS：这个补充脚本会额外关注视频和流媒体相关扩展名。
-const ASSET_EXTS = [
-    'avif',
-    'bin',
-    'css',
-    'gif',
-    'html',
-    'ico',
-    'jpg',
-    'jpeg',
-    'js',
-    'json',
-    'ktx',
-    'ktx2',
-    'm3u8',
-    'm4s',
-    'mov',
-    'mp3',
-    'mp4',
-    'otf',
-    'png',
-    'svg',
-    'ts',
-    'ttf',
-    'wasm',
-    'wav',
-    'webm',
-    'webp',
-    'woff',
-    'woff2'
-];
-
 const TEXT_EXTS = new Set(['.html', '.js', '.mjs', '.json', '.css', '.txt', '.m3u8']);
-const IMAGE_EXTS = new Set(['.png', '.jpg', '.jpeg', '.gif', '.webp', '.avif', '.svg']);
 
-// MAGIC_BYTES：只对明确能判断的二进制格式做文件头校验。
-// mp4/webm/mov/m3u8 这类媒体不强制 magic，避免不同编码容器误判。
-const MAGIC_BYTES = {
-    '.png': [0x89, 0x50, 0x4e, 0x47],
-    '.jpg': [0xff, 0xd8, 0xff],
-    '.jpeg': [0xff, 0xd8, 0xff],
-    '.gif': [0x47, 0x49, 0x46],
-    '.webp': [0x52, 0x49, 0x46, 0x46],
-    '.wasm': [0x00, 0x61, 0x73, 0x6d],
-    '.woff': [0x77, 0x4f, 0x46, 0x46],
-    '.woff2': [0x77, 0x4f, 0x46, 0x32],
-    '.ktx': [0xab, 0x4b, 0x54, 0x58],
-    '.ktx2': [0xab, 0x4b, 0x54, 0x58]
-};
-
-// 命令参数：
-// --retry-bad：本地已有文件也重新下载/校验，适合清理坏缓存后重跑。
 const args = new Set(process.argv.slice(2));
 const SHOULD_RETRY_BAD = args.has('--retry-bad');
-
-function mirrorRoot() {
-    return path.join(ROOT, MIRROR_NAME);
-}
 
 function readTextIfExists(filePath) {
     return fs.existsSync(filePath) ? fs.readFileSync(filePath, 'utf8') : '';
@@ -104,7 +34,7 @@ function cmsPrefix() {
 }
 
 function findCacheId() {
-    const indexHtml = readTextIfExists(path.join(mirrorRoot(), 'index.html'));
+    const indexHtml = readTextIfExists(path.join(MIRROR_DIR, 'index.html'));
     for (const pattern of CACHE_PATTERNS) {
         const match = indexHtml.match(pattern);
         if (match) return match[1];
@@ -120,7 +50,7 @@ function findCacheId() {
 }
 
 function findExistingAppBundle() {
-    const jsDir = path.join(mirrorRoot(), 'assets', 'js');
+    const jsDir = path.join(MIRROR_DIR, 'assets', 'js');
     if (!fs.existsSync(jsDir)) return null;
 
     return fs.readdirSync(jsDir)
@@ -130,7 +60,7 @@ function findExistingAppBundle() {
 }
 
 function findExistingUilFiles() {
-    const dataDir = path.join(mirrorRoot(), 'assets', 'data');
+    const dataDir = path.join(MIRROR_DIR, 'assets', 'data');
     if (!fs.existsSync(dataDir)) return [];
 
     return fs.readdirSync(dataDir)
@@ -148,7 +78,6 @@ function isSupportedAssetUrl(value) {
     }
 }
 
-// 把文本里提取出来的字符串整理成可下载资源。
 function normalizeAssetPath(rawPath) {
     if (!rawPath) return null;
 
@@ -191,8 +120,6 @@ function extractAssetPathsFromText(text) {
         }
     }
 
-    // CMS 里可能有带空格、括号的远程媒体 URL。
-    // 这种 URL 用普通正则容易截断，所以按固定前缀做宽松扫描。
     let cursor = 0;
     while (true) {
         const start = text.indexOf(cmsPrefix(), cursor);
@@ -273,10 +200,6 @@ function isValidDownload(localPath, response, buffer) {
     return !contentType.includes('text/html');
 }
 
-// 保存路径规则：
-// 1. 目标站自身资源保存到 MIRROR_NAME/assets/...
-// 2. 远程存储资源保存到 MIRROR_NAME/远程域名/...
-// 3. 其他远程域名保存到 MIRROR_NAME/域名/...
 function localPathForAsset(assetPath) {
     let relativePath = assetPath;
 
@@ -291,7 +214,7 @@ function localPathForAsset(assetPath) {
     }
 
     const cleanPath = decodeURIComponent(relativePath.replace(/^\/+/, '')) || 'index.html';
-    return path.join(mirrorRoot(), cleanPath);
+    return path.join(MIRROR_DIR, cleanPath);
 }
 
 function remoteUrlForAsset(assetPath) {
@@ -324,11 +247,11 @@ function collectLocalSources() {
     const cacheId = findCacheId();
 
     for (const filePath of [
-        path.join(mirrorRoot(), 'index.html'),
+        path.join(MIRROR_DIR, 'index.html'),
         path.join(ROOT, 'unsupported.html'),
-        path.join(mirrorRoot(), 'assets', 'js', `app.${cacheId}.js`),
-        path.join(mirrorRoot(), 'assets', 'js', `modules.${cacheId}.js`),
-        path.join(mirrorRoot(), 'assets', 'data', `uil.${cacheId}.json`),
+        path.join(MIRROR_DIR, 'assets', 'js', `app.${cacheId}.js`),
+        path.join(MIRROR_DIR, 'assets', 'js', `modules.${cacheId}.js`),
+        path.join(MIRROR_DIR, 'assets', 'data', `uil.${cacheId}.json`),
         findExistingAppBundle(),
         ...findExistingUilFiles()
     ]) {
@@ -351,11 +274,11 @@ function walk(dir, output = []) {
 function collectBadCachedAssets() {
     const bad = new Set();
 
-    for (const filePath of walk(mirrorRoot())) {
+    for (const filePath of walk(MIRROR_DIR)) {
         const ext = path.extname(filePath).toLowerCase();
         if (!ASSET_EXTS.includes(ext.slice(1))) continue;
 
-        const relativePath = path.relative(mirrorRoot(), filePath).replace(/\\/g, '/');
+        const relativePath = path.relative(MIRROR_DIR, filePath).replace(/\\/g, '/');
         const buffer = fs.readFileSync(filePath);
         const fakeResponse = { headers: { get: () => '' } };
         if (!isValidDownload(filePath, fakeResponse, buffer)) bad.add(relativePath);
@@ -372,9 +295,11 @@ function collectInitialAssets() {
     assets.add(`assets/js/modules.${cacheId}.js`);
     assets.add(`assets/data/uil.${cacheId}.json`);
 
-    for (const page of CMS_PAGES) {
-        assets.add(`${CMS_HOST}/cms/${page}-latest.json`);
-        assets.add(`${CMS_HOST}/cms/${page}-dev.json`);
+    if (CMS_HOST) {
+        for (const page of CMS_PAGES) {
+            assets.add(`${CMS_HOST}/cms/${page}-latest.json`);
+            assets.add(`${CMS_HOST}/cms/${page}-dev.json`);
+        }
     }
 
     for (const filePath of collectLocalSources()) {
@@ -386,7 +311,6 @@ function collectInitialAssets() {
                 const json = JSON.parse(text);
                 for (const item of extractAssetPathsFromJson(json)) assets.add(item);
             } catch {
-                // JSON 已损坏时不继续提取资源，交给下载阶段重试。
             }
         }
     }
@@ -464,6 +388,12 @@ async function loadDownloadedAsset(assetPath) {
 }
 
 async function main() {
+    if (!CMS_HOST) {
+        console.log('CMS_HOST is not configured. Skipping CMS media download.');
+        console.log('Set CMS_MEDIA_HOST environment variable or edit config.js to enable.');
+        return;
+    }
+
     const pending = collectInitialAssets();
     const seen = new Set();
     const stats = { save: 0, skip: 0, fail: 0, reject: 0, error: 0 };
@@ -498,7 +428,7 @@ async function main() {
 
     console.log('\nDone.');
     console.log(stats);
-    console.log(`Mirror folder: ${mirrorRoot()}`);
+    console.log(`Mirror folder: ${MIRROR_DIR}`);
     console.log(`Scanned unique resources: ${seen.size}`);
 }
 

@@ -2,49 +2,19 @@ const http = require('http');
 const fs = require('fs');
 const path = require('path');
 const { exec } = require('child_process');
+const {
+    TARGET_HOST, MIRROR_NAME, START_PATH, PORT, TIMEOUT_MS,
+    REMOTE_MIRRORS, MAGIC_BYTES, MIME_TYPES, IMAGE_EXTS, ROOT
+} = require('./config');
 
-// ====== 站点配置区：换网站时主要改这里 ======
-// PORT：本地服务器端口。默认 3000，可以用环境变量 PORT 覆盖。
-const PORT = Number(process.env.PORT || 3000);
-
-// TARGET_HOST：目标网站源站，只写协议 + 域名，不要带最后的斜杠。
-// 默认使用 example.com 作为占位示例，避免把某个真实网站当成框架默认内容。
-// 真正扒站时，把这里改成目标站点，例如 https://www.example-site.com。
-const TARGET_HOST = process.env.TARGET_HOST || 'https://example.com';
-
-// MIRROR_NAME：本地镜像文件夹名。
-// 规则：不管扒什么网站，所有目标网站内容都先进这个文件夹。
-// 外层 index.html 永远只做框架说明页，不保存目标网站首页。
-// 默认用目标域名去掉开头的 www.，例如 www.example-site.com -> example-site.com。
-const MIRROR_NAME = process.env.MIRROR_NAME || 'example.com';
-
-// START_PATH：目标站点入口路径。
-// 默认从根路径 / 开始；换网站时可以改成 /cn、/zh-hans、/home 等。
-const START_PATH = process.env.START_PATH || '/';
-
-// REQUEST_TIMEOUT_MS：单个远程请求超时时间，防止某个资源一直卡住。
-const REQUEST_TIMEOUT_MS = Number(process.env.PROXY_TIMEOUT_MS || 30000);
-
-// REMOTE_MIRRORS：手动远程资源映射。
-// 这个数组不是绑定某一个网站的规则；如果别的网站也有同样结构，也可以继续用。
-// 例子：
-// { prefix: '/cdn.example.com/', origin: 'https://cdn.example.com' }
-const REMOTE_MIRRORS = [];
-
-// BUILTIN_REMOTE_MIRRORS：内置通用映射。
-// 当前保持为空，避免把某个旧网站的 CDN 专用地址写死到框架里。
+const REQUEST_TIMEOUT_MS = TIMEOUT_MS;
 const BUILTIN_REMOTE_MIRRORS = [];
 
-// IGNORED_PATH_PREFIXES：浏览器、插件、OAuth、MCP 等探测请求。
-// 这些通常不是目标网站资源，不缓存，避免日志刷屏。
 const IGNORED_PATH_PREFIXES = [
     '/.well-known/',
     '/bb-mcp'
 ];
 
-// ====== 通用规则区：不是某个网站专用，不要随便删 ======
-// 有些站点资源路径带点，例如 /etc.clientlibs/...，它不是远程域名。
-// 这些前缀应当继续拼到 TARGET_HOST 后面去抓。
 const SITE_PATH_PREFIXES = new Set([
     'content',
     'etc.clientlibs',
@@ -54,74 +24,17 @@ const SITE_PATH_PREFIXES = new Set([
     'graphql'
 ]);
 
-// 判断路径第一段是否像“被本地化后的远程域名”。
-// 例如 /assets.adobedtm.com/a.js 可以代理到 https://assets.adobedtm.com/a.js。
-// 要求至少两个点，是为了避免把 /etc.clientlibs/... 误判成域名。
 function looksLikeMirroredRemoteHost(segment) {
     return /^[a-z0-9-]+(\.[a-z0-9-]+){2,}$/i.test(segment);
 }
 
-// 运行时只重写 HTML/CSS。
-// 不能重写 JS：很多压缩脚本里有正则、模板字符串和转义 URL，粗暴替换会把脚本改坏，
-// 典型表现就是菜单、轮播、弹窗等交互全部点不开。
 const REWRITE_TEXT_EXTS = new Set(['.html', '.css']);
-
-// JS/JSON 只做“外链前缀 -> 本地镜像前缀”的精确替换。
-// 这样离线时媒体、CMS、第三方脚本会先走 localhost，但不会破坏压缩 JS 里的正则。
 const EXTERNAL_URL_REWRITE_TEXT_EXTS = new Set(['.js', '.mjs', '.json']);
 const REWRITE_ASSET_EXTS = [
     'avif', 'bin', 'css', 'gif', 'html', 'ico', 'jpg', 'jpeg', 'js', 'json',
     'ktx', 'ktx2', 'mjs', 'mov', 'mp3', 'mp4', 'otf', 'png', 'svg', 'ttf',
     'wasm', 'wav', 'webm', 'webp', 'woff', 'woff2'
 ];
-
-// MIME_TYPES：告诉浏览器每类文件应该怎么解析。
-const MIME_TYPES = {
-    '.html': 'text/html; charset=utf-8',
-    '.css': 'text/css; charset=utf-8',
-    '.js': 'application/javascript; charset=utf-8',
-    '.mjs': 'application/javascript; charset=utf-8',
-    '.json': 'application/json; charset=utf-8',
-    '.png': 'image/png',
-    '.jpg': 'image/jpeg',
-    '.jpeg': 'image/jpeg',
-    '.gif': 'image/gif',
-    '.svg': 'image/svg+xml',
-    '.ico': 'image/x-icon',
-    '.webp': 'image/webp',
-    '.avif': 'image/avif',
-    '.mp4': 'video/mp4',
-    '.webm': 'video/webm',
-    '.mov': 'video/quicktime',
-    '.mp3': 'audio/mpeg',
-    '.wav': 'audio/wav',
-    '.wasm': 'application/wasm',
-    '.woff': 'font/woff',
-    '.woff2': 'font/woff2',
-    '.otf': 'font/opentype',
-    '.ttf': 'font/ttf',
-    '.bin': 'application/octet-stream',
-    '.ktx': 'image/ktx',
-    '.ktx2': 'image/ktx2',
-    '.zip': 'application/zip'
-};
-
-// MAGIC_BYTES：常见二进制文件头校验。
-// 作用：防止远程返回 HTML 错误页，却被保存成 jpg/png/wasm/font。
-const MAGIC_BYTES = {
-    '.png': [0x89, 0x50, 0x4e, 0x47],
-    '.jpg': [0xff, 0xd8, 0xff],
-    '.jpeg': [0xff, 0xd8, 0xff],
-    '.gif': [0x47, 0x49, 0x46],
-    '.webp': [0x52, 0x49, 0x46, 0x46],
-    '.wasm': [0x00, 0x61, 0x73, 0x6d],
-    '.woff': [0x77, 0x4f, 0x46, 0x46],
-    '.woff2': [0x77, 0x4f, 0x46, 0x32],
-    '.ktx': [0xab, 0x4b, 0x54, 0x58],
-    '.ktx2': [0xab, 0x4b, 0x54, 0x58]
-};
-
-const IMAGE_EXTS = new Set(['.png', '.jpg', '.jpeg', '.gif', '.webp', '.avif', '.svg']);
 
 function isMirrorRequest(reqPath) {
     return reqPath === `/${MIRROR_NAME}` || reqPath.startsWith(`/${MIRROR_NAME}/`);
@@ -132,8 +45,6 @@ function stripMirrorPrefix(reqPath) {
     return reqPath.slice(MIRROR_NAME.length + 1) || '/';
 }
 
-// 页面路由通常没有扩展名，例如 /about、/cn/about。
-// 本地保存时统一落成 index.html，避免浏览器把无扩展名文件当下载文件。
 function isRoutePath(reqPath) {
     return path.extname(reqPath) === '';
 }
@@ -151,7 +62,6 @@ function hasExpectedMagic(filePath, buffer) {
     return magic.every((byte, index) => buffer[index] === byte);
 }
 
-// 这是缓存安全阀：不要把 HTML fallback 错误页存成图片、字体、JSON 等假资源。
 function isValidCachedResponse(filePath, response, buffer) {
     const ext = path.extname(filePath).toLowerCase();
     const contentType = (response.headers.get('content-type') || '').toLowerCase();
@@ -173,8 +83,6 @@ function isValidCachedResponse(filePath, response, buffer) {
         return !contentType.includes('text/html');
     }
 
-    // 有些站点扩展名不准，例如 .png 实际返回 image/jpeg。
-    // 只要响应明确是图片，就允许保存。
     if (IMAGE_EXTS.has(ext) && contentType.startsWith('image/')) {
         return true;
     }
@@ -186,10 +94,8 @@ function ensureDirExists(filePath) {
     fs.mkdirSync(path.dirname(filePath), { recursive: true });
 }
 
-// 把 URL 路径安全映射到项目目录内。
-// 核心规则：目标网站内容必须放在 MIRROR_NAME 文件夹里。
 function getLocalPath(reqPath) {
-    const baseDir = __dirname;
+    const baseDir = ROOT;
     let safePath = decodeURIComponent(reqPath);
 
     if (!isMirrorRequest(safePath)) {
@@ -247,10 +153,8 @@ function getMirrorEntryPath() {
     return startPath === '/' ? `/${MIRROR_NAME}/` : `/${MIRROR_NAME}${startPath}`;
 }
 
-// 外层入口页由服务器注入当前配置。
-// 这样 index.html 不需要写死网站名，也不需要先靠浏览器额外 fetch 才知道入口路径。
 function serveStarterPage(res) {
-    const filePath = path.join(__dirname, 'index.html');
+    const filePath = path.join(ROOT, 'index.html');
     fs.readFile(filePath, 'utf8', (err, text) => {
         if (err) {
             res.writeHead(500, { 'Content-Type': 'text/plain; charset=utf-8' });
@@ -297,11 +201,6 @@ function getLocalUrlPrefixForHost(host, slash) {
     return `${separator}${MIRROR_NAME}${separator}${host}${separator}`;
 }
 
-// 重写所有明确写出来的 http/https 外链前缀。
-// 例子：
-// https://cdn.example.com/a.js -> /当前镜像文件夹/cdn.example.com/a.js
-// https://目标站/assets/a.js -> /当前镜像文件夹/assets/a.js
-// 如果 JS 里是 https:\/\/cdn.example.com\/a.js，也保持转义斜杠形式。
 function rewriteExternalUrlsForLocalMirror(text) {
     const plainUrl = /\bhttps?:\/\/([a-z0-9.-]+\.[a-z]{2,})(\/)/gi;
     const escapedUrl = /\bhttps?:\\\/\\\/([a-z0-9.-]+\.[a-z]{2,})(\\\/)/gi;
@@ -311,8 +210,6 @@ function rewriteExternalUrlsForLocalMirror(text) {
         .replace(escapedUrl, (match, host, slash) => getLocalUrlPrefixForHost(host, slash));
 }
 
-// 把页面里的远程 URL 改成本地镜像 URL。
-// 例如 https://cdn.example.com/a.js -> /example-site.com/cdn.example.com/a.js。
 function rewriteTextForLocalMirror(text) {
     const extGroup = REWRITE_ASSET_EXTS.join('|');
     const mirror = escapeRegExp(MIRROR_NAME);
@@ -363,7 +260,6 @@ function getGoogleStorageTargetUrl(reqPath, search) {
     return null;
 }
 
-// 根据请求路径生成真正要抓取的远程 URL。
 function getTargetUrl(req, reqPath) {
     const requestUrl = new URL(req.url, `http://localhost:${PORT}`);
     const targetPath = isMirrorRequest(reqPath) ? stripMirrorPrefix(reqPath) : reqPath;
@@ -440,12 +336,8 @@ const server = http.createServer(async (req, res) => {
         return;
     }
 
-    // 外层 / 永远打开框架说明页。
-    // 目标站点入口请访问 /MIRROR_NAME/START_PATH，例如 /example.com/。
     const reqPath = parsedUrl.pathname === '/' ? '/index.html' : parsedUrl.pathname;
 
-    // 给外层 index.html 用的运行时配置。
-    // 这样启动页不用写死 /example.com/，会自动读取当前 server.js 顶部配置。
     if (reqPath === '/__mirror-config.json') {
         res.writeHead(200, {
             'Content-Type': 'application/json; charset=utf-8',
